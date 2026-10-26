@@ -12,6 +12,10 @@
     stream into the Output Log box and are also written to a timestamped log
     file in the chosen Log Folder.
 
+    The Host column uses the node's DNS name. If a node has no DNS name, its
+    IP address is used instead. If neither exists, a warning is logged and the
+    Host is written empty.
+
     Compile to a single .exe with PS2EXE (see the bottom of this file).
 
     Runtime requirements on the target Windows machine:
@@ -102,8 +106,10 @@ $ExtractionWorker = {
         $pad       = $sync.PadWidth
         $outFile   = Join-Path $outFolder $sync.OutputFileName
 
+        # IPAddress is selected only as a fallback for Host; it is not in $FinalColumns.
         $nodeQuery = @'
 SELECT n.NodeID AS NodeID, n.Caption AS Name, n.DNS AS Host,
+n.IPAddress AS IPAddress,
 CASE
 WHEN n.ObjectSubType = 'SNMP' THEN 'ping|snmptraffic|snmpcpu|snmpmemory'
 WHEN n.ObjectSubType = 'WMI' THEN 'ping|wmicpuload|wmimemory|wmilogicaldisk'
@@ -169,15 +175,29 @@ WHERE cm.MemberEntityType = 'Orion.Nodes'
         $sb = [System.Text.StringBuilder]::new()
         [void]$sb.Append((($FinalColumns) -join ',') + "`r`n")
         $warnings = New-Object System.Collections.Generic.List[string]
+        $ipFallbackCount = 0
         foreach ($n in $nodes) {
             $nid = [string]$n.NodeID
             $row = @{}
             foreach ($col in $FinalColumns) { $row[$col] = $n.$col }
             $row['Group']             = if ($groups.ContainsKey($nid))  { $groups[$nid] }  else { $n.CategoryName }
             $row['TrafficInterfaces'] = if ($traffic.ContainsKey($nid)) { $traffic[$nid] } else { '' }
-            if ([string]::IsNullOrWhiteSpace([string]$row['Host'])) {
-                $warnings.Add(("Node '{0}' has no DNS Host; row written with an empty Host." -f $row['Name']))
+
+            # Host: prefer the DNS name, fall back to the IP address.
+            $hostValue = if ($null -eq $row['Host'] -or $row['Host'] -is [System.DBNull]) { '' } else { ([string]$row['Host']).Trim() }
+            if ([string]::IsNullOrWhiteSpace($hostValue)) {
+                $ip = if ($null -eq $n.IPAddress -or $n.IPAddress -is [System.DBNull]) { '' } else { ([string]$n.IPAddress).Trim() }
+                if (-not [string]::IsNullOrWhiteSpace($ip)) {
+                    $row['Host'] = $ip
+                    $ipFallbackCount++
+                } else {
+                    $row['Host'] = ''
+                    $warnings.Add(("Node '{0}' has no DNS Host and no IP address; row written with an empty Host." -f $row['Name']))
+                }
+            } else {
+                $row['Host'] = $hostValue
             }
+
             $line = ($FinalColumns | ForEach-Object { Format-CsvField $row[$_] }) -join ','
             [void]$sb.Append($line + "`r`n")
         }
@@ -188,6 +208,9 @@ WHERE cm.MemberEntityType = 'Orion.Nodes'
         [System.IO.File]::WriteAllText($outFile, $sb.ToString(), $utf8Bom)
 
         Write-Log ("Wrote {0} row(s) -> {1}" -f $nodes.Count, $outFile)
+        if ($ipFallbackCount -gt 0) {
+            Write-Log ("  {0} node(s) had no DNS name; IP address used as Host" -f $ipFallbackCount)
+        }
 
         $bar = ('=' * 50)
         Write-Log $bar
